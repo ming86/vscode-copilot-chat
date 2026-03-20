@@ -156,6 +156,8 @@ export interface IMakeChatRequestOptions {
 	debugName: string;
 	/** The array of chat messages to send */
 	messages: Raw.ChatMessage[];
+	/** Enable WebSocket transport for this request when supported. */
+	useWebSocket?: boolean;
 	ignoreStatefulMarker?: boolean;
 	/** Streaming callback for each response part. */
 	finishedCb: FinishedCallback | undefined;
@@ -163,6 +165,10 @@ export interface IMakeChatRequestOptions {
 	location: ChatLocation;
 	/** Optional source of the chat request */
 	source?: Source;
+	/** Conversation identifier used for request-scoped state (for example WebSocket connection reuse). */
+	conversationId?: string;
+	/** Identifier for a single tool-calling turn within a conversation. */
+	turnId?: string;
 	/** Additional request options */
 	requestOptions?: Omit<OptionalChatRequestParams, 'n'>;
 	/** Indicates if the request was user-initiated */
@@ -177,8 +183,10 @@ export interface IMakeChatRequestOptions {
 	enableRetryOnError?: boolean;
 	/** Which fetcher to use, overrides the default. */
 	useFetcher?: FetcherId;
-	/** Disable extended thinking for this request. Used when resuming from tool call errors where the original thinking blocks are not available. */
-	disableThinking?: boolean;
+	/** Explicitly enable thinking for this request. When not set, thinking is disabled. */
+	enableThinking?: boolean;
+	/** Reasoning effort level for this request (e.g. 'low', 'medium', 'high'). Only used when enableThinking is true or when the model supports reasoning effort. */
+	reasoningEffort?: string;
 	/** Enable retrying once on simple network errors like ECONNRESET. */
 	canRetryOnceWithoutRollback?: boolean;
 	/** Custom metadata to be displayed in the log document */
@@ -216,11 +224,13 @@ export interface IChatEndpoint extends IEndpoint {
 	readonly maxOutputTokens: number;
 	/** The model ID- this may change and will be `copilot-base` for the base model. Use `family` to switch behavior based on model type. */
 	readonly model: string;
+	readonly modelProvider: string;
 	readonly apiType?: string;
 	readonly supportsThinkingContentInHistory?: boolean;
 	readonly supportsAdaptiveThinking?: boolean;
 	readonly minThinkingBudget?: number;
 	readonly maxThinkingBudget?: number;
+	readonly supportsReasoningEffort?: string[];
 	readonly supportsToolCalls: boolean;
 	readonly supportsVision: boolean;
 	readonly supportsPrediction: boolean;
@@ -363,7 +373,8 @@ function networkRequest(
 		'conversation-subagent' :
 		options.requestKindOptions?.kind === 'background' ?
 			'conversation-background' :
-			intent === 'conversation-agent' ? intent : undefined;
+			intent === 'conversation-agent' ? intent :
+				intent;
 
 	const headers: ReqHeaders = {
 		Authorization: `Bearer ${secretKey}`,
@@ -373,10 +384,8 @@ function networkRequest(
 		...additionalHeaders,
 		...(endpoint.getExtraHeaders ? endpoint.getExtraHeaders(location) : {}),
 	};
-	if (agentInteractionType) {
-		headers['X-Interaction-Type'] = agentInteractionType;
-		headers['X-Agent-Task-Id'] = requestId;
-	}
+	headers['X-Interaction-Type'] = agentInteractionType;
+	headers['X-Agent-Task-Id'] = requestId;
 
 	if (endpoint.interceptBody) {
 		endpoint.interceptBody(body);
@@ -384,6 +393,7 @@ function networkRequest(
 
 	const endpointFetchOptions = endpoint.getEndpointFetchOptions?.();
 	const request: FetchOptions = {
+		callSite: `network-request-${intent}`,
 		method: requestType,
 		headers: headers,
 		json: body,
@@ -434,6 +444,7 @@ export function canRetryOnceNetworkError(reason: any) {
 		'ERR_HTTP2_STREAM_CANCEL',
 		'ERR_HTTP2_GOAWAY_SESSION',
 		'ERR_HTTP2_PROTOCOL_ERROR',
+		'ERR_FAILED',
 	].includes(reason?.code);
 }
 

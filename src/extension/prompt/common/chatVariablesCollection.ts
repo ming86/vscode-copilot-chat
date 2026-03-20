@@ -120,8 +120,26 @@ export function isPromptInstructionText(variable: PromptVariable): variable is P
 /**
  * Check if provided variable is a "prompt file".
  */
-export function isPromptFile(variable: PromptVariable): boolean {
+export function isPromptFile(variable: PromptVariable): variable is PromptVariable & { value: vscode.Uri } {
 	return variable.reference.id.startsWith(PromptFileIdPrefix);
 }
 
 export const PromptFileIdPrefix = 'vscode.prompt.file';
+
+/**
+ * Check if provided variable is an "instruction file".
+ */
+export function isInstructionFile(variable: PromptVariable): variable is PromptVariable & { value: vscode.Uri } {
+	return variable.reference.id.startsWith(InstructionFileIdPrefix);
+}
+
+export const InstructionFileIdPrefix = 'vscode.instructions.file';
+
+/**
+ * Check if provided variable is the workspace "customizations index" file.
+ */
+export function isCustomizationsIndex(variable: PromptVariable): variable is PromptVariable & { value: vscode.Uri } {
+	return variable.reference.id === CustomizationsIndexId;
+}
+
+export const CustomizationsIndexId = 'vscode.customizations.index';

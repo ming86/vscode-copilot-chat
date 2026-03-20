@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 import * as vscode from 'vscode';
 import { IAuthenticationService } from '../../../platform/authentication/common/authentication';
-import { IChatAgentService, defaultAgentName, editingSessionAgent2Name, editingSessionAgentEditorName, editingSessionAgentName, editsAgentName, getChatParticipantIdFromName, notebookEditorAgentName, terminalAgentName, vscodeAgentName } from '../../../platform/chat/common/chatAgents';
+import { IChatAgentService, defaultAgentName, editingSessionAgentEditorName, editingSessionAgentName, editsAgentName, getChatParticipantIdFromName, notebookEditorAgentName, terminalAgentName, vscodeAgentName } from '../../../platform/chat/common/chatAgents';
 import { IChatQuotaService } from '../../../platform/chat/common/chatQuotaService';
 import { IInteractionService } from '../../../platform/chat/common/interactionService';
 import { ConfigKey, IConfigurationService } from '../../../platform/configuration/common/configurationService';
@@ -16,6 +16,8 @@ import { generateUuid } from '../../../util/vs/base/common/uuid';
 import { IInstantiationService } from '../../../util/vs/platform/instantiation/common/instantiation';
 import { ChatRequest } from '../../../vscodeTypes';
 import { Intent, agentsToCommands } from '../../common/constants';
+import { ICopilotChatResultIn } from '../../prompt/common/conversation';
+import { getSwitchToAutoOnRateLimitConfirmation } from '../../prompt/common/specialRequestTypes';
 import { ChatParticipantRequestHandler } from '../../prompt/node/chatParticipantRequestHandler';
 import { IFeedbackReporter } from '../../prompt/node/feedbackReporter';
 import { IPromptCategorizerService } from '../../prompt/node/promptCategorizer';
@@ -75,7 +77,6 @@ class ChatAgents implements IDisposable {
 		this.additionalWelcomeMessage = this.instantiationService.invokeFunction(getAdditionalWelcomeMessage);
 		this._disposables.add(this.registerDefaultAgent());
 		this._disposables.add(this.registerEditingAgent());
-		this._disposables.add(this.registerEditingAgent2());
 		this._disposables.add(this.registerEditingAgentEditor());
 		this._disposables.add(this.registerEditsAgent());
 		this._disposables.add(this.registerNotebookEditorDefaultAgent());
@@ -134,14 +135,6 @@ class ChatAgents implements IDisposable {
 	private registerEditingAgentEditor(): IDisposable {
 		const editingAgent = this.createAgent(editingSessionAgentEditorName, Intent.InlineChat);
 		editingAgent.iconPath = new vscode.ThemeIcon('copilot');
-		return editingAgent;
-	}
-
-	private registerEditingAgent2(): IDisposable {
-		const editingAgent = this.createAgent(editingSessionAgent2Name, Intent.Edit2);
-		editingAgent.iconPath = new vscode.ThemeIcon('copilot');
-		editingAgent.additionalWelcomeMessage = this.additionalWelcomeMessage;
-		editingAgent.titleProvider = this.instantiationService.createInstance(ChatTitleProvider);
 		return editingAgent;
 	}
 
@@ -206,6 +199,13 @@ Learn more about [GitHub Copilot](https://docs.github.com/copilot/using-github-c
 			// If we need to switch to the base model, this function will handle it
 			// Otherwise it just returns the same request passed into it
 			request = await this.switchToBaseModel(request, stream);
+
+			// Handle switch-to-auto confirmation button clicks from rate limit errors
+			const switchToAutoConfirmation = getSwitchToAutoOnRateLimitConfirmation(request);
+			if (switchToAutoConfirmation) {
+				request = await this.switchToAutoModel(request, stream, switchToAutoConfirmation.alwaysSwitchToAuto);
+			}
+
 			// The user is starting an interaction with the chat
 			if (!request.subAgentInvocationId) {
 				this.interactionService.startInteraction();
@@ -231,7 +231,20 @@ Learn more about [GitHub Copilot](https://docs.github.com/copilot/using-github-c
 				defaultIntentId;
 
 			const handler = this.instantiationService.createInstance(ChatParticipantRequestHandler, context.history, request, stream, token, { agentName: name, agentId: id, intentId }, () => context.yieldRequested, telemetryMessageId);
-			return await handler.getResult();
+			let result = await handler.getResult();
+
+			// Auto-retry with Auto model when the setting is enabled and the handler signals it
+			if ((result as ICopilotChatResultIn).metadata?.shouldAutoSwitchToAuto) {
+				const previousModelId = request.model?.id;
+				const switchedRequest = await this.switchToAutoModel(request, stream, false);
+				if (switchedRequest.model?.id !== previousModelId) {
+					request = switchedRequest;
+					const retryHandler = this.instantiationService.createInstance(ChatParticipantRequestHandler, context.history, request, stream, token, { agentName: name, agentId: id, intentId }, () => context.yieldRequested, telemetryMessageId);
+					result = await retryHandler.getResult();
+				}
+			}
+
+			return result;
 		};
 	}
 
@@ -265,6 +278,20 @@ Learn more about [GitHub Copilot](https://docs.github.com/copilot/using-github-c
 			messageString = new vscode.MarkdownString(vscode.l10n.t('You have exceeded your premium request allowance. We have automatically switched you to {0} which is included with your plan. To enable additional paid premium requests, contact your organization admin.', baseEndpoint.name));
 		}
 		stream.warning(messageString);
+		return request;
+	}
+
+	private async switchToAutoModel(request: vscode.ChatRequest, stream: vscode.ChatResponseStream, alwaysSwitchToAuto: boolean): Promise<ChatRequest> {
+		const autoModel = (await vscode.lm.selectChatModels({ id: 'auto', vendor: 'copilot' }))[0];
+		if (!autoModel) {
+			return request;
+		}
+		await vscode.commands.executeCommand('workbench.action.chat.changeModel', { vendor: autoModel.vendor, id: autoModel.id, family: autoModel.family });
+		request = { ...request, model: autoModel };
+		if (alwaysSwitchToAuto) {
+			await vscode.workspace.getConfiguration('github.copilot').update('chat.rateLimitAutoSwitchToAuto', true, vscode.ConfigurationTarget.Global);
+		}
+		stream.warning(new vscode.MarkdownString(vscode.l10n.t('You were rate-limited on the selected model. Switching to Auto and retrying your request.')));
 		return request;
 	}
 }
