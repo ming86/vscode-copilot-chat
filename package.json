@@ -2838,6 +2838,13 @@
 				"category": "GitHub Copilot"
 			},
 			{
+				"command": "github.copilot.chat.createPullRequestCopilotCLIAgentSession.updatePR",
+				"title": "%github.copilot.chat.createPullRequestCopilotCLIAgentSession.updatePR%",
+				"enablement": "!chatSessionRequestInProgress",
+				"icon": "$(git-pull-request)",
+				"category": "GitHub Copilot"
+			},
+			{
 				"command": "github.copilot.chat.createDraftPullRequestCopilotCLIAgentSession.createDraftPR",
 				"title": "%github.copilot.chat.createDraftPullRequestCopilotCLIAgentSession.createDraftPR%",
 				"enablement": "!chatSessionRequestInProgress",
@@ -4562,10 +4569,10 @@
 							"advanced"
 						]
 					},
-					"github.copilot.chat.cli.checkpoints.enabled": {
+					"github.copilot.chat.cli.autoCommit.enabled": {
 						"type": "boolean",
-						"default": false,
-						"markdownDescription": "%github.copilot.config.cli.checkpoints.enabled%",
+						"default": true,
+						"markdownDescription": "%github.copilot.config.cli.autoCommit.enabled%",
 						"tags": [
 							"advanced",
 							"experimental"
@@ -4859,6 +4866,11 @@
 					"command": "github.copilot.chat.createDraftPullRequestCopilotCLIAgentSession.createDraftPR",
 					"when": "chatSessionType == copilotcli && isSessionsWindow && !sessions.hasOpenPullRequest",
 					"group": "pull_request@2"
+				},
+				{
+					"command": "github.copilot.chat.createPullRequestCopilotCLIAgentSession.updatePR",
+					"when": "chatSessionType == copilotcli && isSessionsWindow && sessions.hasOpenPullRequest",
+					"group": "pull_request@1"
 				}
 			],
 			"chat/contextUsage/actions": [
@@ -5165,6 +5177,10 @@
 				},
 				{
 					"command": "github.copilot.chat.createPullRequestCopilotCLIAgentSession.createPR",
+					"when": "false"
+				},
+				{
+					"command": "github.copilot.chat.createPullRequestCopilotCLIAgentSession.updatePR",
 					"when": "false"
 				},
 				{
@@ -5957,6 +5973,14 @@
 						"description": "Complete a security review of the pending changes on the current branch"
 					},
 					{
+						"name": "simplify",
+						"description": "Review changed code for reuse, quality, and efficiency"
+					},
+					{
+						"name": "claude-api",
+						"description": "Help building with Claude API or Anthropic SDK"
+					},
+					{
 						"name": "agents",
 						"description": "Create and manage specialized Claude agents"
 					},
@@ -6266,7 +6290,7 @@
 		"@anthropic-ai/claude-agent-sdk": "^0.2.76",
 		"@anthropic-ai/sdk": "^0.79.0",
 		"@github/blackbird-external-ingest-utils": "^0.3.0",
-		"@github/copilot": "^1.0.9",
+		"@github/copilot": "^1.0.10",
 		"@google/genai": "^1.22.0",
 		"@humanwhocodes/gitignore-to-minimatch": "1.0.2",
 		"@microsoft/tiktokenizer": "^1.0.10",
@@ -6314,5 +6338,5 @@
 		"node-gyp": "npm:node-gyp@10.3.1",
 		"zod": "3.25.76"
 	},
-	"vscodeCommit": "631a8bb1fd9d262e926340015fb4eef442758c0a"
+	"vscodeCommit": "55969564bb5637a0fe1bdf5a665c5c5f21723407"
 }

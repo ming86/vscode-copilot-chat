@@ -18,7 +18,7 @@ import { extUriBiasedIgnorePathCase, relativePath } from '../../../../util/vs/ba
 import { URI } from '../../../../util/vs/base/common/uri';
 import { IInstantiationService } from '../../../../util/vs/platform/instantiation/common/instantiation';
 import { ChatReferenceBinaryData, ChatReferenceDiagnostic, FileType, Location } from '../../../../vscodeTypes';
-import { ChatVariablesCollection, isCustomizationsIndex, isInstructionFile, isPromptFile, isPromptInstruction, PromptVariable } from '../../../prompt/common/chatVariablesCollection';
+import { ChatVariablesCollection, isCustomizationsIndex, isInstructionFile, isPromptFile, PromptVariable } from '../../../prompt/common/chatVariablesCollection';
 import { generateUserPrompt } from '../../../prompts/node/agent/copilotCLIPrompt';
 import { getWorkingDirectory, isIsolationEnabled, IWorkspaceInfo } from '../../common/workspaceInfo';
 import { ICopilotCLIImageSupport, isImageMimeType } from './copilotCLIImageSupport';
@@ -71,13 +71,14 @@ export class CopilotCLIPromptResolver {
 	private async constructChatVariablesAndAttachments(variables: ChatVariablesCollection, workspaceInfo: IWorkspaceInfo, additionalWorkspaces: IWorkspaceInfo[], token: vscode.CancellationToken): Promise<[variables: ChatVariablesCollection, Attachment[]]> {
 		const validReferences: vscode.ChatPromptReference[] = [];
 		const fileFolderReferences: vscode.ChatPromptReference[] = [];
+		const builtinSlashCommandReferences: vscode.ChatPromptReference[] = [];
 		const isolationEnabled = isIsolationEnabled(workspaceInfo) || additionalWorkspaces.some(ws => isIsolationEnabled(ws));
 		const folderToWorktreeMap = this.buildFolderToWorktreeMap(workspaceInfo, additionalWorkspaces);
 		const hasAnyWorkingDirectory = getWorkingDirectory(workspaceInfo) || additionalWorkspaces.some(ws => getWorkingDirectory(ws));
 		const knownSkillLocations = this.skillsService.getSkillsLocations();
 		await Promise.all(Array.from(variables).map(async variable => {
 			// Unsupported references: prompt instructions, instruction files, and the customizations index.
-			if (isPromptInstruction(variable) || isInstructionFile(variable) || isCustomizationsIndex(variable)) {
+			if (isInstructionFile(variable) || isCustomizationsIndex(variable)) {
 				return;
 			}
 			// No need to include skill prompt files as an attachment if CLI already knows about them.
@@ -85,8 +86,16 @@ export class CopilotCLIPromptResolver {
 			if (promptFileUri && knownSkillLocations.some(loc => extUriBiasedIgnorePathCase.isEqualOrParent(promptFileUri, loc))) {
 				return;
 			}
-
-
+			// GitHub pull request references
+			if (isGitHubPullRequestReference(variable.reference)) {
+				builtinSlashCommandReferences.push(variable.reference);
+				return;
+			}
+			// Git merge changes references
+			if (isGitMergeChangesReference(variable.reference)) {
+				builtinSlashCommandReferences.push(variable.reference);
+				return;
+			}
 			// If isolation is enabled, and we have workspace repo information, skip it.
 			if (isolationEnabled && isWorkspaceRepoInformationItem(variable)) {
 				return;
@@ -137,6 +146,28 @@ export class CopilotCLIPromptResolver {
 				});
 			}
 		});
+
+		// Add attachments for built-in slash command references
+		for (const reference of builtinSlashCommandReferences) {
+			// GitHub pull request reference
+			if (isGitHubPullRequestReference(reference) && URI.isUri(reference.value)) {
+				attachments.push({
+					type: 'blob',
+					mimeType: 'text/plain',
+					data: reference.value.toString(),
+				});
+			}
+
+			// Git merge changes reference
+			if (isGitMergeChangesReference(reference) && typeof reference.value === 'string') {
+				attachments.push({
+					type: 'blob',
+					mimeType: 'text/plain',
+					data: reference.value,
+				});
+			}
+		}
+
 		variables = new ChatVariablesCollection(validReferences);
 		return [variables, attachments];
 	}
@@ -205,6 +236,7 @@ export class CopilotCLIPromptResolver {
 			if (!URI.isUri(uri)) {
 				return;
 			}
+
 			// Attachment of Source control items.
 			if (uri.scheme === 'scm-history-item') {
 				return;
@@ -321,4 +353,12 @@ function isWorkspaceRepoInformationItem(variable: PromptVariable): boolean {
 		(ref.modelDescription).startsWith('Information about one of the current repositories') || (ref.modelDescription).startsWith('Information about the current repository'))
 		&&
 		ref.value.startsWith('Repository name:');
+}
+
+function isGitHubPullRequestReference(ref: vscode.ChatPromptReference): boolean {
+	return ref.id === 'github-pull-request';
+}
+
+function isGitMergeChangesReference(ref: vscode.ChatPromptReference): boolean {
+	return ref.id === 'git-merge-changes';
 }
