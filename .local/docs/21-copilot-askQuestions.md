@@ -1,1152 +1,862 @@
-# Copilot askQuestions Tool Documentation
+# askQuestions Tool Documentation
 
 ## Overview
 
-The `askQuestions` tool enables the language model to request clarifications, preferences, or confirmations from the user during task execution. Questions are presented via VS Code's native QuickPick UI, supporting both single-select and multi-select modes with automatic free-text input capability.
+The `askQuestions` tool enables Copilot to pose clarifying questions to the user during agent-mode conversations. Questions are rendered as an interactive **question carousel** within the chat response stream, allowing the user to answer, skip, or provide free-form text before the agent proceeds.
 
 **Primary Use Cases:**
-- Clarifying ambiguous requirements before proceeding
+- Clarifying ambiguous requirements before implementation
 - Gathering user preferences on implementation choices
-- Confirming high-impact decisions before execution
-- Collecting missing information without guessing
+- Confirming decisions that meaningfully affect outcome
 
-**Tool Category:** VS Code Interaction
+**Tool Category:** VS Code Interaction (`ToolCategory.VSCodeInteraction`)
 
-**UI Mechanism:** VS Code QuickPick API with optional InputBox for free-text
+**UI Surface:** Question carousel via `stream.questionCarousel()` (proposed `chatParticipantAdditions` API)
 
----
-
-## Complete Implementation
-
-This section provides the full, copy-paste-ready implementation.
-
-### Dependencies
-
-```typescript
-// VS Code API (stable, available in VS Code 1.93+)
-import * as vscode from 'vscode';
-
-// For standalone extension, replace these with:
-// - ITelemetryService → @vscode/extension-telemetry or no-op
-// - ILogService → vscode.window.createOutputChannel() or console
-// - DisposableStore → simple array of disposables or vscode.Disposable.from()
-// - StopWatch → performance.now() inline
-// - CancellationToken → vscode.CancellationToken
-```
-
-### Type Definitions
-
-```typescript
-/**
- * A single option within a question
- */
-interface IQuestionOption {
-	/** Option label text */
-	label: string;
-	/** Optional description shown below label */
-	description?: string;
-	/** Mark as recommended (displays star icon) */
-	recommended?: boolean;
-}
-
-/**
- * A question to present to the user
- */
-interface IQuestion {
-	/** Short label (max 12 chars), used as unique identifier and QuickPick title */
-	header: string;
-	/** Complete question text displayed as placeholder */
-	question: string;
-	/** Allow multiple selections (default: false) */
-	multiSelect?: boolean;
-	/** 2-4 options for the user to choose from */
-	options: IQuestionOption[];
-}
-
-/**
- * Tool input parameters
- */
-interface IAskQuestionsParams {
-	/** Array of 1-4 questions to present sequentially */
-	questions: IQuestion[];
-}
-
-/**
- * Tool output returned to the model
- */
-interface IAnswerResult {
-	/** Answers keyed by question header */
-	answers: Record<string, {
-		/** Array of selected option labels */
-		selected: string[];
-		/** Custom text if "Other..." was used, null otherwise */
-		freeText: string | null;
-		/** True if user cancelled/escaped */
-		skipped: boolean;
-	}>;
-}
-
-/**
- * Extended QuickPickItem for internal use
- */
-interface IQuickPickOptionItem extends vscode.QuickPickItem {
-	/** Whether this is the recommended option */
-	isRecommended?: boolean;
-	/** Whether this is the "Other..." free-text option */
-	isFreeText?: boolean;
-	/** Original label without star prefix (used in results) */
-	originalLabel: string;
-}
-```
-
-### Complete Tool Class
-
-```typescript
-export class AskQuestionsTool implements vscode.LanguageModelTool<IAskQuestionsParams> {
-	/**
-	 * Tool name for registration
-	 * Use with vscode.lm.registerTool('copilot_askQuestions', new AskQuestionsTool())
-	 */
-	public static readonly toolName = 'ask_questions';
-
-	constructor(
-		// Replace with your telemetry service or remove
-		private readonly _telemetryService?: { sendTelemetryEvent: (name: string, props: Record<string, string | undefined>, metrics: Record<string, number>) => void },
-		// Replace with vscode.window.createOutputChannel() or remove
-		private readonly _logService?: { trace: (msg: string) => void },
-	) { }
-
-	/**
-	 * Main invocation method called by the language model
-	 */
-	async invoke(
-		options: vscode.LanguageModelToolInvocationOptions<IAskQuestionsParams>,
-		token: vscode.CancellationToken
-	): Promise<vscode.LanguageModelToolResult> {
-		const startTime = performance.now();
-		const { questions } = options.input;
-		this._logService?.trace(`[AskQuestionsTool] Invoking with ${questions.length} question(s)`);
-
-		const result: IAnswerResult = { answers: {} };
-		let currentStep = 0;
-
-		// Sequential question loop with back-navigation support
-		while (currentStep < questions.length) {
-			// Check cancellation before each question
-			if (token.isCancellationRequested) {
-				// Mark remaining questions as skipped
-				for (let i = currentStep; i < questions.length; i++) {
-					const q = questions[i];
-					result.answers[q.header] = {
-						selected: [],
-						freeText: null,
-						skipped: true
-					};
-				}
-				break;
-			}
-
-			const question = questions[currentStep];
-			const answer = await this._askQuestion(question, currentStep, questions.length, token);
-
-			if (answer === 'back' && currentStep > 0) {
-				// Go back to previous question
-				currentStep--;
-				continue;
-			}
-
-			if (answer === 'skipped') {
-				// User pressed ESC - mark current and remaining questions as skipped
-				for (let i = currentStep; i < questions.length; i++) {
-					const q = questions[i];
-					result.answers[q.header] = {
-						selected: [],
-						freeText: null,
-						skipped: true
-					};
-				}
-				break;
-			}
-
-			// Store answer and advance
-			result.answers[question.header] = answer as { selected: string[]; freeText: string | null; skipped: boolean };
-			currentStep++;
-		}
-
-		// Calculate and send telemetry
-		const duration = performance.now() - startTime;
-		this._sendTelemetry(options.toolInvocationToken, questions, result, duration);
-
-		// Return JSON result to model
-		return new vscode.LanguageModelToolResult([
-			new vscode.LanguageModelTextPart(JSON.stringify(result))
-		]);
-	}
-
-	/**
-	 * Validation and UI message preparation
-	 */
-	prepareInvocation(
-		options: vscode.LanguageModelToolInvocationPrepareOptions<IAskQuestionsParams>,
-		_token: vscode.CancellationToken
-	): vscode.ProviderResult<vscode.PreparedToolInvocation> {
-		const { questions } = options.input;
-
-		// Validate: at least one question required
-		if (!questions || questions.length === 0) {
-			throw new Error(vscode.l10n.t('No questions provided. The questions array must contain at least one question.'));
-		}
-
-		// Validate: each question must have at least 2 options
-		for (const question of questions) {
-			if (!question.options || question.options.length < 2) {
-				throw new Error(vscode.l10n.t('Question "{0}" must have at least two options.', question.header));
-			}
-		}
-
-		// Build UI messages
-		const questionCount = questions.length;
-		const message = questionCount === 1
-			? vscode.l10n.t('Asking a question')
-			: vscode.l10n.t('Asking {0} questions', questionCount);
-		const pastMessage = questionCount === 1
-			? vscode.l10n.t('Asked a question')
-			: vscode.l10n.t('Asked {0} questions', questionCount);
-
-		return {
-			invocationMessage: new vscode.MarkdownString(message),
-			pastTenseMessage: new vscode.MarkdownString(pastMessage)
-		};
-	}
-
-	/**
-	 * Get the default option (recommended or first)
-	 */
-	private _getDefaultOption(question: IQuestion): IQuestionOption {
-		const recommended = question.options.find(opt => opt.recommended);
-		return recommended ?? question.options[0];
-	}
-
-	/**
-	 * Present a single question via QuickPick
-	 */
-	private async _askQuestion(
-		question: IQuestion,
-		step: number,
-		totalSteps: number,
-		token: vscode.CancellationToken
-	): Promise<{ selected: string[]; freeText: string | null; skipped: boolean } | 'back' | 'skipped'> {
-		// Check cancellation before showing UI
-		if (token.isCancellationRequested) {
-			return 'skipped';
-		}
-
-		return new Promise((resolve) => {
-			// Race condition protection: prevent double-resolution
-			let resolved = false;
-			const safeResolve = (value: { selected: string[]; freeText: string | null; skipped: boolean } | 'back' | 'skipped') => {
-				if (!resolved) {
-					resolved = true;
-					resolve(value);
-				}
-			};
-
-			// Create QuickPick
-			const quickPick = vscode.window.createQuickPick<IQuickPickOptionItem>();
-			quickPick.title = question.header;
-			quickPick.placeholder = question.question;
-			quickPick.step = step + 1;
-			quickPick.totalSteps = totalSteps;
-			quickPick.canSelectMany = question.multiSelect ?? false;
-			quickPick.ignoreFocusOut = true;
-
-			// Build option items
-			const items: IQuickPickOptionItem[] = question.options.map(opt => ({
-				label: opt.recommended ? `$(star-full) ${opt.label}` : opt.label,
-				description: opt.description,
-				isRecommended: opt.recommended,
-				isFreeText: false,
-				originalLabel: opt.label
-			}));
-
-			// Always add "Other..." free-text option
-			items.push({
-				label: vscode.l10n.t('Other...'),
-				description: vscode.l10n.t('Enter custom answer'),
-				isFreeText: true,
-				originalLabel: 'Other'
-			});
-
-			quickPick.items = items;
-
-			// Set default selection
-			const defaultOption = this._getDefaultOption(question);
-			const defaultItem = items.find(item =>
-				item.originalLabel === defaultOption.label || item.isRecommended
-			);
-
-			if (defaultItem) {
-				if (question.multiSelect) {
-					quickPick.selectedItems = [defaultItem]; // Pre-checked for multi-select
-				} else {
-					quickPick.activeItems = [defaultItem];   // Pre-highlighted for single-select
-				}
-			}
-
-			// Add back button for multi-step flows
-			if (step > 0) {
-				quickPick.buttons = [vscode.QuickInputButtons.Back];
-			}
-
-			// Disposables for cleanup
-			const disposables: vscode.Disposable[] = [quickPick];
-
-			// Handle cancellation token
-			disposables.push(
-				token.onCancellationRequested(() => {
-					quickPick.hide();
-				})
-			);
-
-			// Handle back button
-			disposables.push(
-				quickPick.onDidTriggerButton(button => {
-					if (button === vscode.QuickInputButtons.Back) {
-						quickPick.hide();
-						safeResolve('back');
-					}
-				})
-			);
-
-			// Handle selection acceptance
-			disposables.push(
-				quickPick.onDidAccept(async () => {
-					const selectedItems = question.multiSelect
-						? quickPick.selectedItems
-						: quickPick.activeItems;
-
-					// No selection: use default
-					if (selectedItems.length === 0) {
-						quickPick.hide();
-						safeResolve({
-							selected: [defaultOption.label],
-							freeText: null,
-							skipped: false
-						});
-						return;
-					}
-
-					// Check if "Other..." was selected
-					const freeTextItem = selectedItems.find(item => item.isFreeText);
-					if (freeTextItem) {
-						// Mark resolved before hiding to prevent onDidHide race
-						resolved = true;
-						quickPick.hide();
-
-						// Show input box for custom text
-						const freeTextInput = await vscode.window.showInputBox({
-							prompt: question.question,
-							placeHolder: vscode.l10n.t('Enter your answer'),
-							ignoreFocusOut: true
-						}, token);
-
-						// Get other selections (excluding "Other...")
-						const otherSelections = selectedItems
-							.filter(item => !item.isFreeText)
-							.map(item => item.originalLabel);
-
-						if (freeTextInput === undefined) {
-							// User cancelled input box
-							if (otherSelections.length > 0) {
-								// Preserve other selections
-								resolve({
-									selected: otherSelections,
-									freeText: null,
-									skipped: false
-								});
-							} else {
-								// No other selections: treat as skipped
-								resolve('skipped');
-							}
-						} else {
-							// Free text provided
-							resolve({
-								selected: otherSelections.length > 0 ? otherSelections : [freeTextItem.originalLabel],
-								freeText: freeTextInput,
-								skipped: false
-							});
-						}
-						return;
-					}
-
-					// Regular selection (no free text)
-					quickPick.hide();
-					safeResolve({
-						selected: selectedItems.map(item => item.originalLabel),
-						freeText: null,
-						skipped: false
-					});
-				})
-			);
-
-			// Handle hide (ESC or dismiss)
-			disposables.push(
-				quickPick.onDidHide(() => {
-					// Resolve before disposal to prevent race conditions
-					safeResolve('skipped');
-					disposables.forEach(d => d.dispose());
-				})
-			);
-
-			// Show the QuickPick
-			quickPick.show();
-		});
-	}
-
-	/**
-	 * Send telemetry metrics
-	 */
-	private _sendTelemetry(
-		requestId: string | undefined,
-		questions: IQuestion[],
-		result: IAnswerResult,
-		duration: number
-	): void {
-		if (!this._telemetryService) {
-			return;
-		}
-
-		const answers = Object.values(result.answers);
-		const answeredCount = answers.filter(a => !a.skipped).length;
-		const skippedCount = answers.filter(a => a.skipped).length;
-		const freeTextCount = answers.filter(a => a.freeText !== null).length;
-		const recommendedAvailableCount = questions.filter(q => q.options.some(opt => opt.recommended)).length;
-		const recommendedSelectedCount = questions.filter(q => {
-			const answer = result.answers[q.header];
-			const recommendedOption = q.options.find(opt => opt.recommended);
-			return answer && !answer.skipped && recommendedOption && answer.selected.includes(recommendedOption.label);
-		}).length;
-
-		this._telemetryService.sendTelemetryEvent(
-			'askQuestionsToolInvoked',
-			{ requestId },
-			{
-				questionCount: questions.length,
-				answeredCount,
-				skippedCount,
-				freeTextCount,
-				recommendedAvailableCount,
-				recommendedSelectedCount,
-				duration
-			}
-		);
-	}
-}
-```
-
-### Extension Registration (activate function)
-
-```typescript
-export function activate(context: vscode.ExtensionContext) {
-	// Register the tool
-	const tool = new AskQuestionsTool(
-		// Optional: pass telemetry service
-		// Optional: pass log service
-	);
-
-	context.subscriptions.push(
-		vscode.lm.registerTool('copilot_askQuestions', tool)
-	);
-}
-```
-
-### package.json Contribution (Complete)
-
-```json
-{
-	"contributes": {
-		"languageModelTools": [
-			{
-				"name": "copilot_askQuestions",
-				"toolReferenceName": "askQuestions",
-				"displayName": "Ask Questions",
-				"userDescription": "Ask questions to clarify requirements before proceeding with a task.",
-				"modelDescription": "Ask the user questions when progress is blocked or a decision carries significant risk. Prefer proposing a sensible default so users can confirm quickly.\n\nWhen to use:\n- Clarify ambiguous requirements before proceeding\n- Get user preferences on implementation choices\n- Confirm high-impact decisions\n\nQuestion guidelines:\n- Batch related questions into a single call to minimize interruption\n- Provide brief context explaining what is being decided and why it matters\n- Mark one option as `recommended` with a short justification\n- Keep options mutually exclusive for single-select; use `multiSelect: true` only when choices are additive\n\nAfter receiving answers:\n- Restate the chosen decisions briefly and proceed\n- Do not re-ask unless requirements change\n\n- An \"Other\" option is automatically shown to users for custom input—do not add your own \"Something else\" or similar option.",
-				"icon": "$(question)",
-				"canBeReferencedInPrompt": true,
-				"when": "config.myExtension.askQuestions.enabled",
-				"inputSchema": {
-					"type": "object",
-					"properties": {
-						"questions": {
-							"type": "array",
-							"description": "Array of 1-4 questions to ask the user",
-							"minItems": 1,
-							"maxItems": 4,
-							"items": {
-								"type": "object",
-								"properties": {
-									"header": {
-										"type": "string",
-										"description": "A short label (max 12 chars) displayed as a quick pick header, also used as the unique identifier for the question",
-										"maxLength": 12
-									},
-									"question": {
-										"type": "string",
-										"description": "The complete question text to display"
-									},
-									"multiSelect": {
-										"type": "boolean",
-										"description": "Allow multiple selections",
-										"default": false
-									},
-									"options": {
-										"type": "array",
-										"description": "2-4 options for the user to choose from",
-										"minItems": 2,
-										"maxItems": 4,
-										"items": {
-											"type": "object",
-											"properties": {
-												"label": {
-													"type": "string",
-													"description": "Option label text"
-												},
-												"description": {
-													"type": "string",
-													"description": "Optional description for the option"
-												},
-												"recommended": {
-													"type": "boolean",
-													"description": "Mark this option as recommended"
-												}
-											},
-											"required": ["label"]
-										}
-									}
-								},
-								"required": ["header", "question", "options"]
-							}
-						}
-					},
-					"required": ["questions"]
-				}
-			}
-		],
-		"configuration": {
-			"type": "object",
-			"title": "Ask Questions Tool",
-			"properties": {
-				"myExtension.askQuestions.enabled": {
-					"type": "boolean",
-					"default": true,
-					"description": "Allow agent mode to ask clarifying questions before proceeding with a task."
-				}
-			}
-		}
-	}
-}
-```
+**Feature Gate:** `github.copilot.chat.askQuestions.enabled` (default `true`, tags: `experimental`, `onExp`)
 
 ---
-
-## API Reference (Quick Summary)
-
-The following sections provide additional reference documentation. The complete implementation above is the authoritative source.
-
-### Tool Declaration (JSON Schema)
-
-```typescript
-{
-	name: 'copilot_askQuestions',
-	toolReferenceName: 'askQuestions',
-	displayName: 'Ask Questions',
-	icon: '$(question)',
-	canBeReferencedInPrompt: true,
-	when: 'config.github.copilot.chat.askQuestions.enabled',
-	inputSchema: {
-		type: 'object',
-		properties: {
-			questions: {
-				type: 'array',
-				description: 'Array of 1-4 questions to ask the user',
-				minItems: 1,
-				maxItems: 4,
-				items: {
-					type: 'object',
-					properties: {
-						header: {
-							type: 'string',
-							description: 'A short label (max 12 chars) displayed as a quick pick header, also used as the unique identifier for the question',
-							maxLength: 12
-						},
-						question: {
-							type: 'string',
-							description: 'The complete question text to display'
-						},
-						multiSelect: {
-							type: 'boolean',
-							description: 'Allow multiple selections',
-							default: false
-						},
-						options: {
-							type: 'array',
-							description: '2-4 options for the user to choose from',
-							minItems: 2,
-							maxItems: 4,
-							items: {
-								type: 'object',
-								properties: {
-									label: { type: 'string', description: 'Option label text' },
-									description: { type: 'string', description: 'Optional description for the option' },
-									recommended: { type: 'boolean', description: 'Mark this option as recommended' }
-								},
-								required: ['label']
-							}
-						}
-					},
-					required: ['header', 'question', 'options']
-				}
-			}
-		},
-		required: ['questions']
-	}
-}
-```
-
-## Input Parameters
-
-### questions (required)
-- **Type:** `IQuestion[]`
-- **Constraints:** 1-4 items
-- **Description:** Array of questions to present to the user sequentially
-
-### Question Object Properties
-
-| Property | Type | Required | Description |
-|----------|------|----------|-------------|
-| `header` | `string` | Yes | Short label (max 12 chars), used as unique identifier and QuickPick title |
-| `question` | `string` | Yes | Complete question text displayed as placeholder |
-| `multiSelect` | `boolean` | No | Allow multiple selections (default: `false`) |
-| `options` | `IQuestionOption[]` | Yes | 2-4 options for the user to choose from |
-
-### Option Object Properties
-
-| Property | Type | Required | Description |
-|----------|------|----------|-------------|
-| `label` | `string` | Yes | Option label text |
-| `description` | `string` | No | Additional description shown below label |
-| `recommended` | `boolean` | No | Mark as recommended (displays star icon) |
-
-### Examples
-
-```typescript
-// Single question with recommended option
-{
-	questions: [{
-		header: 'Language',
-		question: 'Which programming language should I use for this project?',
-		options: [
-			{ label: 'TypeScript', description: 'Strongly typed JavaScript', recommended: true },
-			{ label: 'JavaScript', description: 'Dynamic scripting language' },
-			{ label: 'Python', description: 'General purpose language' }
-		]
-	}]
-}
-
-// Multi-select question
-{
-	questions: [{
-		header: 'Features',
-		question: 'Which features should I include?',
-		multiSelect: true,
-		options: [
-			{ label: 'Logging', recommended: true },
-			{ label: 'Error handling' },
-			{ label: 'Unit tests' },
-			{ label: 'Documentation' }
-		]
-	}]
-}
-
-// Multiple questions
-{
-	questions: [
-		{
-			header: 'Framework',
-			question: 'Which framework do you prefer?',
-			options: [
-				{ label: 'React', recommended: true },
-				{ label: 'Vue' },
-				{ label: 'Angular' }
-			]
-		},
-		{
-			header: 'Styling',
-			question: 'How should styles be managed?',
-			options: [
-				{ label: 'CSS Modules' },
-				{ label: 'Tailwind CSS', recommended: true },
-				{ label: 'Styled Components' }
-			]
-		}
-	]
-}
-```
-
-## Output Format
-
-The tool returns a JSON object with answers keyed by the question's `header`:
-
-```typescript
-interface IAnswerResult {
-	answers: Record<string, {
-		selected: string[];      // Array of selected option labels
-		freeText: string | null; // Custom text if "Other..." was used
-		skipped: boolean;        // True if user cancelled/escaped
-	}>;
-}
-```
-
-### Example Output
-
-**Single selection:**
-```json
-{
-	"answers": {
-		"Language": {
-			"selected": ["TypeScript"],
-			"freeText": null,
-			"skipped": false
-		}
-	}
-}
-```
-
-**Multi-select with free text:**
-```json
-{
-	"answers": {
-		"Features": {
-			"selected": ["Logging", "Error handling", "Other"],
-			"freeText": "Custom metrics collection",
-			"skipped": false
-		}
-	}
-}
-```
-
-**User cancelled:**
-```json
-{
-	"answers": {
-		"Language": {
-			"selected": [],
-			"freeText": null,
-			"skipped": true
-		}
-	}
-}
-```
 
 ## Architecture
 
-### High-Level Flow
+### Data Flow
 
 ```
-Model Request → AskQuestionsTool.invoke()
-    ↓
-prepareInvocation() [Validation]
-    ↓
-Sequential Question Loop
-    ↓
-┌─────────────────────────────────────┐
-│ For each question:                   │
-│   1. Create QuickPick UI             │
-│   2. Render options + "Other..."     │
-│   3. Wait for selection              │
-│   4. Handle free-text if needed      │
-│   5. Store answer, advance or back   │
-└─────────────────────────────────────┘
-    ↓
-Aggregate Answers → JSON Result
-    ↓
-LanguageModelToolResult
+LLM generates tool call
+        │
+        ▼
+┌─────────────────────┐
+│  prepareInvocation() │  ← validates input, builds confirmation messages
+└─────────┬───────────┘
+          │
+          ▼
+┌─────────────────────┐
+│   resolveInput()     │  ← captures IBuildPromptContext (provides stream)
+└─────────┬───────────┘
+          │
+          ▼
+┌─────────────────────┐
+│     invoke()         │
+│                     │
+│  1. Convert IQuestion[] → ChatQuestion[]  (_convertToChatQuestion)
+│  2. stream.questionCarousel(chatQuestions, true)  ← awaits user answers
+│  3. stream.progress('Analyzing your answers...')
+│  4. Normalize answers  (_convertCarouselAnswers)
+│  5. Send telemetry
+│  6. Return IAnswerResult as LanguageModelToolResult
+└─────────────────────┘
 ```
 
-### Component Diagram
+### Component Relationships
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    AskQuestionsTool                              │
-│  File: src/extension/tools/vscode-node/askQuestionsTool.ts      │
-├─────────────────────────────────────────────────────────────────┤
-│ Static:                                                          │
-│   static readonly toolName = ToolName.AskQuestions              │
+┌──────────────────────────────────────────────────────────────────┐
+│  AskQuestionsTool                                                │
 │                                                                  │
-│ Dependencies:                                                    │
-│   ITelemetryService - Usage metrics                             │
-│   ILogService - Debug logging                                   │
-│                                                                  │
-│ Methods:                                                         │
-│   prepareInvocation() - Validation, UI message generation       │
-│   invoke() - Main execution loop                                │
-│   private askQuestion() - Single question QuickPick handler     │
-│   private _getDefaultOption() - Recommended option resolution   │
-│   private _sendTelemetry() - Metrics emission                   │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    VS Code QuickPick API                         │
-├─────────────────────────────────────────────────────────────────┤
-│ vscode.window.createQuickPick<IQuickPickOptionItem>()           │
-│   - title: question.header                                      │
-│   - placeholder: question.question                              │
-│   - canSelectMany: question.multiSelect                         │
-│   - ignoreFocusOut: true                                        │
-│   - step/totalSteps: Navigation indicators                      │
-│   - buttons: [Back] when step > 0                               │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    VS Code InputBox API                          │
-├─────────────────────────────────────────────────────────────────┤
-│ vscode.window.showInputBox() — for "Other..." free text         │
-│   - prompt: question.question                                   │
-│   - placeHolder: "Enter your answer"                            │
-│   - ignoreFocusOut: true                                        │
-└─────────────────────────────────────────────────────────────────┘
+│  ┌────────────────┐    ┌──────────────────────┐                  │
+│  │ resolveInput() │───▶│ _promptContext.stream │                  │
+│  └────────────────┘    └──────────┬───────────┘                  │
+│                                   │                              │
+│  ┌────────────────┐               │                              │
+│  │    invoke()    │◀──────────────┘                              │
+│  └───────┬────────┘                                              │
+│          │                                                       │
+│          ├──▶ _convertToChatQuestion()  → ChatQuestion           │
+│          │         Maps IQuestion → ChatQuestion                 │
+│          │         Determines ChatQuestionType (Text/Single/Multi)│
+│          │         Sets defaultValue from recommended options     │
+│          │                                                       │
+│          ├──▶ stream.questionCarousel()  → Record<string, unknown>│
+│          │         Proposed VS Code API                          │
+│          │         Returns answers keyed by question id          │
+│          │                                                       │
+│          └──▶ _convertCarouselAnswers()  → IAnswerResult         │
+│                    Normalizes heterogeneous answer formats        │
+│                    Handles: string, array, selectedValue,         │
+│                    selectedValues, freeformValue, label           │
+└──────────────────────────────────────────────────────────────────┘
 ```
-
-## Key Implementation Details
-
-### Tool Registration
-
-```typescript
-// src/extension/tools/vscode-node/askQuestionsTool.ts
-ToolRegistry.registerTool(AskQuestionsTool);
-```
-
-The tool self-registers at module load time via the `ToolRegistry` pattern.
-
-### Tool Name Mapping
-
-| Registry | Value |
-|----------|-------|
-| `ToolName.AskQuestions` | `'ask_questions'` |
-| `ContributedToolName.AskQuestions` | `'copilot_askQuestions'` |
-
-### Category Assignment
-
-```typescript
-toolCategory = ToolCategory.VSCodeInteraction
-```
-
-### Validation (prepareInvocation)
-
-Runtime validation occurs before any UI is shown:
-
-```typescript
-prepareInvocation(options, token) {
-	const { questions } = options.input;
-
-	if (!questions || questions.length === 0) {
-		throw new Error('No questions provided. The questions array must contain at least one question.');
-	}
-
-	for (const question of questions) {
-		if (!question.options || question.options.length < 2) {
-			throw new Error(`Question "${question.header}" must have at least two options.`);
-		}
-	}
-
-	// Singular/plural message formatting
-	const questionCount = questions.length;
-	const message = questionCount === 1
-		? vscode.l10n.t('Asking a question')
-		: vscode.l10n.t('Asking {0} questions', questionCount);
-	const pastMessage = questionCount === 1
-		? vscode.l10n.t('Asked a question')
-		: vscode.l10n.t('Asked {0} questions', questionCount);
-
-	return {
-		invocationMessage: new MarkdownString(message),
-		pastTenseMessage: new MarkdownString(pastMessage)
-	};
-}
-```
-
-### "Other..." Option Injection
-
-An automatic free-text option is appended to every question:
-
-```typescript
-items.push({
-	label: vscode.l10n.t('Other...'),
-	description: vscode.l10n.t('Enter custom answer'),
-	isFreeText: true,
-	originalLabel: 'Other'
-});
-```
-
-When selected, `vscode.window.showInputBox()` captures custom text:
-
-```typescript
-const freeTextInput = await vscode.window.showInputBox({
-	prompt: question.question,
-	placeHolder: vscode.l10n.t('Enter your answer'),
-	ignoreFocusOut: true
-}, token);
-```
-
-**Free-text cancellation behaviour:**
-- If free-text input is cancelled but other selections exist, those selections are preserved
-- If free-text input is cancelled with no other selections, the question is marked `skipped`
-- If free-text input is provided, `selected` array contains other selections (if any) or `['Other']` if none
-
-```typescript
-if (freeTextInput === undefined) {
-	// User cancelled the input box
-	if (otherSelections.length > 0) {
-		resolve({ selected: otherSelections, freeText: null, skipped: false });
-	} else {
-		resolve('skipped');
-	}
-} else {
-	resolve({
-		selected: otherSelections.length > 0 ? otherSelections : [freeTextItem.originalLabel],
-		freeText: freeTextInput,
-		skipped: false
-	});
-}
-```
-
-### Recommended Option Rendering
-
-Options marked `recommended: true` display a star icon:
-
-```typescript
-label: opt.recommended ? `$(star-full) ${opt.label}` : opt.label
-```
-
-### Multi-Step Navigation
-
-- **Back button:** Displayed when `step > 0`
-- **ESC handling:** Marks current and remaining questions as `skipped: true`
-- **Sequential flow:** Questions presented one at a time
-
-### Race Condition Protection
-
-A `safeResolve` wrapper prevents double-resolution if `onDidHide` fires after `onDidAccept`:
-
-```typescript
-let resolved = false;
-const safeResolve = (value: T) => {
-	if (!resolved) {
-		resolved = true;
-		resolve(value);
-	}
-};
-```
-
-### Default Selection Behaviour
-
-When the QuickPick opens, the default/recommended option is pre-selected differently based on mode:
-
-```typescript
-if (defaultItem) {
-	if (question.multiSelect) {
-		quickPick.selectedItems = [defaultItem];  // Pre-checked for multi-select
-	} else {
-		quickPick.activeItems = [defaultItem];    // Pre-highlighted for single-select
-	}
-}
-```
-
-### Empty Selection Handling
-
-If the user presses Enter with no selection, the default option is returned automatically:
-
-```typescript
-if (selectedItems.length === 0) {
-	quickPick.hide();
-	safeResolve({
-		selected: [defaultOption.label],
-		freeText: null,
-		skipped: false
-	});
-	return;
-}
-```
-
-### Original Label Preservation
-
-The `IQuickPickOptionItem` interface includes an `originalLabel` field to preserve the unmodified label (without star prefix) for output:
-
-```typescript
-interface IQuickPickOptionItem extends vscode.QuickPickItem {
-	originalLabel: string;    // Unmodified label for results
-	isRecommended?: boolean;
-	isFreeText: boolean;
-}
-```
-
-### Token Cancellation Check
-
-Before showing the UI, cancellation is checked:
-
-```typescript
-if (token.isCancellationRequested) {
-	return 'skipped';
-}
-```
-
-### Disposable Management
-
-The implementation uses `DisposableStore` for proper cleanup of QuickPick and event listeners:
-
-```typescript
-const disposables = new DisposableStore();
-try {
-	// ... QuickPick logic
-	disposables.add(quickPick.onDidAccept(...));
-	disposables.add(quickPick.onDidHide(...));
-	disposables.add(quickPick.onDidTriggerButton(...));
-} finally {
-	disposables.dispose();
-}
-```
-
-## Configuration
-
-### Feature Flag
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `github.copilot.chat.askQuestions.enabled` | `true` | Allow agent mode to ask clarifying questions |
-
-### package.json Configuration
-
-```json
-"github.copilot.chat.askQuestions.enabled": {
-	"type": "boolean",
-	"default": true,
-	"markdownDescription": "Allow agent mode to ask clarifying questions before proceeding with a task.",
-	"tags": ["experimental", "onExp"]
-}
-```
-
-### Experimentation Tags
-
-| Tag | Purpose |
-|-----|---------|
-| `experimental` | Marks setting as experimental in Settings UI |
-| `onExp` | Enables VS Code experimentation service override |
-
-### Gating Mechanism
-
-Tool visibility is controlled declaratively via the `when` clause:
-
-```json
-"when": "config.github.copilot.chat.askQuestions.enabled"
-```
-
-## Telemetry
-
-The tool emits `askQuestionsToolInvoked` events with the following metrics:
-
-**String Properties:**
-
-| Property | Description |
-|----------|-------------|
-| `requestId` | Unique identifier for the tool invocation request |
-
-**Numeric Metrics:**
-
-| Metric | Description |
-|--------|-------------|
-| `questionCount` | Total questions presented |
-| `answeredCount` | Questions answered (not skipped) |
-| `skippedCount` | Questions skipped via ESC |
-| `freeTextCount` | Questions with free-text responses |
-| `recommendedAvailableCount` | Questions with a recommended option |
-| `recommendedSelectedCount` | Questions where recommended was selected |
-| `duration` | Total time to complete all questions (ms) |
-
-## Error Handling
-
-| Condition | Behavior |
-|-----------|----------|
-| Empty questions array | Throws error in `prepareInvocation` |
-| Question with < 2 options | Throws error in `prepareInvocation` |
-| User cancellation (ESC) | Marks remaining questions as `skipped: true` |
-| Token cancellation | Aborts and marks remaining as skipped |
-| InputBox dismissal | Falls back to non-free-text selections if any |
-
-## File References
-
-| File | Purpose |
-|------|---------|
-| [src/extension/tools/vscode-node/askQuestionsTool.ts](src/extension/tools/vscode-node/askQuestionsTool.ts) | Main implementation |
-| [src/extension/tools/common/toolNames.ts](src/extension/tools/common/toolNames.ts) | Tool name enums |
-| [src/extension/tools/common/toolsRegistry.ts](src/extension/tools/common/toolsRegistry.ts) | Registration infrastructure |
-| [src/platform/configuration/common/configurationService.ts](src/platform/configuration/common/configurationService.ts) | Configuration definition |
-| [package.json](package.json#L1218-L1291) | Tool schema and configuration |
-
-## Usage Guidelines for Model
-
-### When to Use
-- Clarify ambiguous requirements before proceeding
-- Get user preferences on implementation choices
-- Confirm high-impact decisions
-
-### Best Practices
-- Batch related questions into a single call (max 4)
-- Provide brief context explaining what is being decided
-- Mark one option as `recommended` with a short justification
-- Keep options mutually exclusive for single-select
-- Use `multiSelect: true` only when choices are additive
-
-### After Receiving Answers
-- Restate the chosen decisions briefly and proceed
-- Do not re-ask unless requirements change
-
-### Automatic Behavior
-- An "Other..." option is automatically shown to users for custom input
-- Do not add your own "Something else" or similar option
 
 ---
 
-## Standalone Extension Portability
+## Tool Declaration
 
-### Summary
+Declared in `package.json` under `contributes.languageModelTools`:
 
-The `askQuestions` tool is **fully portable** to a standalone VS Code extension. The complete implementation above uses only stable VS Code APIs. Simply copy the code, adjust the namespace/imports, and register in your extension's `activate()` function.
+```jsonc
+{
+    "name": "copilot_askQuestions",
+    "toolReferenceName": "askQuestions",
+    "displayName": "%copilot.tools.askQuestions.name%",          // "Ask Questions"
+    "userDescription": "%copilot.tools.askQuestions.description%", // "Ask questions to clarify requirements before proceeding with a task."
+    "modelDescription": "Ask the user questions to clarify intent, validate assumptions, or choose between implementation approaches. Prefer proposing a sensible default so users can confirm quickly.\n\nOnly use this tool when the user's answer provides information you cannot determine or reasonably assume yourself. This tool is for gathering information, not for reporting status or problems. If a question has an obvious best answer, take that action instead of asking.\n\nWhen to use:\n- Clarify ambiguous requirements before proceeding\n- Get user preferences on implementation choices\n- Confirm decisions that meaningfully affect outcome\n\nWhen NOT to use:\n- The answer is determinable from code or context\n- Asking for permission to continue or abort\n- Confirming something you can reasonably decide yourself\n- Reporting a problem (instead, attempt to resolve it)\n\nQuestion guidelines:\n- NEVER use `recommended` for quizzes or polls. Recommended options are PRE-SELECTED and visible to users, which would reveal answers\n- Batch related questions into a single call (max 4 questions, 2-6 options each; omit options for free text input)\n- Provide brief context explaining what is being decided and why\n- Only mark an option as `recommended` with a short justification to suggest YOUR preferred implementation choice\n- Keep options mutually exclusive for single-select; use `multiSelect: true` only when choices are additive and phrase the question accordingly\n\nAfter receiving answers:\n- Incorporate decisions and continue without re-asking unless requirements change\n\nAn \"Other\" option is automatically shown to users\u2014do not add your own.",
+    "icon": "$(question)",
+    "when": "config.github.copilot.chat.askQuestions.enabled",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "questions": {
+                "type": "array",
+                "description": "Array of 1-4 questions to ask the user",
+                "minItems": 1,
+                "maxItems": 4,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "header": {
+                            "type": "string",
+                            "description": "A short label (max 12 chars) displayed as a quick pick header, also used as the unique identifier for the question",
+                            "maxLength": 12
+                        },
+                        "question": {
+                            "type": "string",
+                            "description": "The complete question text to display"
+                        },
+                        "multiSelect": {
+                            "type": "boolean",
+                            "description": "Allow multiple selections",
+                            "default": false
+                        },
+                        "options": {
+                            "type": "array",
+                            "description": "0-6 options for the user to choose from. If empty or omitted, shows a free text input instead.",
+                            "minItems": 0,
+                            "maxItems": 6,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": {
+                                        "type": "string",
+                                        "description": "Option label text"
+                                    },
+                                    "description": {
+                                        "type": "string",
+                                        "description": "Optional description for the option"
+                                    },
+                                    "recommended": {
+                                        "type": "boolean",
+                                        "description": "Mark this option as recommended"
+                                    }
+                                },
+                                "required": ["label"]
+                            }
+                        },
+                        "allowFreeformInput": {
+                            "type": "boolean",
+                            "description": "When true, allows user to enter free-form text in addition to selecting options. Use when the user's opinion or custom input would be valuable.",
+                            "default": false
+                        }
+                    },
+                    "required": ["header", "question"]
+                }
+            }
+        },
+        "required": ["questions"]
+    }
+}
+```
 
-### VS Code API Dependencies
+Notable schema constraints:
+- `questions`: 1–4 items. Headers must be unique (used as answer keys).
+- `options`: **optional** (not in `required`). When omitted or empty, the question renders as free-text input (`ChatQuestionType.Text`).
+- `options` count: 0 or 2–6. Exactly 1 option is rejected at runtime by `prepareInvocation`.
+- `allowFreeformInput`: When `true`, the carousel permits free-text entry alongside option selection.
 
-All APIs are **stable** (not proposed):
+---
 
-| API | Namespace | Stability |
-|-----|-----------|-----------|
-| `window.createQuickPick<T>()` | `window` | Stable |
-| `window.showInputBox()` | `window` | Stable |
-| `QuickPickItem` | `window` | Stable |
-| `QuickInputButtons.Back` | `window` | Stable |
-| `l10n.t()` | `l10n` | Stable |
-| `LanguageModelTool<T>` | `lm` | Stable (VS Code 1.93+) |
-| `LanguageModelToolInvocationOptions<T>` | `lm` | Stable |
-| `LanguageModelToolResult` | `lm` | Stable |
-| `PreparedToolInvocation` | `lm` | Stable |
-| `MarkdownString` | Core | Stable |
-| `CancellationToken` | Core | Stable |
+## Input Parameters
 
-### Blocking Issues
+### IQuestion
 
-**None.** All APIs are stable, dependencies are optional or portable.
+| Property | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `header` | `string` | Yes | — | Short label (max 12 chars). Serves as both the display header and the unique key in the answer record. |
+| `question` | `string` | Yes | — | Full question text displayed to the user. |
+| `multiSelect` | `boolean` | No | `false` | When `true`, the question renders as `ChatQuestionType.MultiSelect` (checkboxes). |
+| `options` | `IQuestionOption[]` | No | — | 0 or 2–6 options. Omit for free-text. Exactly 1 option is invalid. |
+| `allowFreeformInput` | `boolean` | No | `false` | Permit free-form text entry in addition to predefined options. |
 
-### Minimum VS Code Version
+### IQuestionOption
 
-**1.93** (when `LanguageModelTool` API was stabilised)
+| Property | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `label` | `string` | Yes | — | Display text and value identifier for the option. |
+| `description` | `string` | No | — | Secondary descriptive text. Appended to label as `"label - description"` in the carousel. |
+| `recommended` | `boolean` | No | — | Pre-selects the option as default. For single-select, only the first recommended option is used. For multi-select, all recommended options become the default array. |
+
+---
+
+## Output Format
+
+### IAnswerResult
+
+The tool returns a JSON-serialized `IAnswerResult` as a `LanguageModelTextPart` within a `LanguageModelToolResult`.
+
+```typescript
+interface IAnswerResult {
+    answers: Record<string, IQuestionAnswer>;
+}
+```
+
+Answers are keyed by `question.header`.
+
+### IQuestionAnswer
+
+| Property | Type | Description |
+|---|---|---|
+| `selected` | `string[]` | Labels of selected options. Empty array if no option selected. |
+| `freeText` | `string \| null` | Free-form text input. `null` when no free text was entered. |
+| `skipped` | `boolean` | `true` if the question was unanswered (carousel skipped, no stream, or unknown answer format). |
+
+---
+
+## Implementation
+
+Source: `src/extension/tools/vscode-node/askQuestionsTool.ts`
+
+### Source (editorially formatted; comments condensed for clarity)
+
+```typescript
+import * as vscode from 'vscode';
+import { ILogService } from '../../../platform/log/common/logService';
+import { ITelemetryService } from '../../../platform/telemetry/common/telemetry';
+import { CancellationToken } from '../../../util/vs/base/common/cancellation';
+import { StopWatch } from '../../../util/vs/base/common/stopwatch';
+import { ChatQuestion, ChatQuestionType, LanguageModelTextPart, LanguageModelToolResult, MarkdownString } from '../../../vscodeTypes';
+import { IBuildPromptContext } from '../../prompt/common/intents';
+import { ToolName } from '../common/toolNames';
+import { CopilotToolMode, ICopilotTool, ToolRegistry } from '../common/toolsRegistry';
+
+export interface IQuestionOption {
+    label: string;
+    description?: string;
+    recommended?: boolean;
+}
+
+export interface IQuestion {
+    header: string;
+    question: string;
+    multiSelect?: boolean;
+    options?: IQuestionOption[];
+    allowFreeformInput?: boolean;
+}
+
+export interface IAskQuestionsParams {
+    questions: IQuestion[];
+}
+
+export interface IQuestionAnswer {
+    selected: string[];
+    freeText: string | null;
+    skipped: boolean;
+}
+
+export interface IAnswerResult {
+    answers: Record<string, IQuestionAnswer>;
+}
+
+export class AskQuestionsTool implements ICopilotTool<IAskQuestionsParams> {
+    public static readonly toolName = ToolName.AskQuestions;
+
+    private _promptContext: IBuildPromptContext | undefined;
+
+    constructor(
+        @ITelemetryService private readonly _telemetryService: ITelemetryService,
+        @ILogService private readonly _logService: ILogService,
+    ) { }
+
+    async invoke(
+        options: vscode.LanguageModelToolInvocationOptions<IAskQuestionsParams>,
+        token: CancellationToken
+    ): Promise<vscode.LanguageModelToolResult> {
+        const stopWatch = StopWatch.create();
+        const { questions } = options.input;
+        this._logService.trace(`[AskQuestionsTool] Invoking with ${questions.length} question(s)`);
+
+        const stream = this._promptContext?.stream;
+        if (!stream) {
+            this._logService.warn('[AskQuestionsTool] No stream available, cannot show question carousel');
+
+            // When no stream is available, return a schema-compliant result with all questions marked as skipped
+            const skippedAnswers: Record<string, IQuestionAnswer> = {};
+            for (const question of questions) {
+                skippedAnswers[question.header] = {
+                    selected: [],
+                    freeText: null,
+                    skipped: true
+                };
+            }
+
+            const toolResultJson = JSON.stringify({ answers: skippedAnswers });
+            return new LanguageModelToolResult([
+                new LanguageModelTextPart(toolResultJson)
+            ]);
+        }
+
+        // Convert IQuestion array to ChatQuestion array
+        const chatQuestions = questions.map(q => this._convertToChatQuestion(q));
+        this._logService.trace(`[AskQuestionsTool] ChatQuestions: ${JSON.stringify(
+            chatQuestions.map(q => ({ id: q.id, title: q.title, type: q.type }))
+        )}`);
+
+        // Show the question carousel and wait for answers
+        const carouselAnswers = await stream.questionCarousel(chatQuestions, true);
+        this._logService.trace(`[AskQuestionsTool] Raw carousel answers: ${JSON.stringify(carouselAnswers)}`);
+
+        // Immediately show progress to address the long pause after carousel submission
+        stream.progress(vscode.l10n.t('Analyzing your answers...'));
+
+        // Convert carousel answers back to IAnswerResult format
+        const result = this._convertCarouselAnswers(questions, carouselAnswers);
+        this._logService.trace(`[AskQuestionsTool] Converted result: ${JSON.stringify(result)}`);
+
+        // Calculate telemetry metrics from results
+        const answers = Object.values(result.answers);
+        const answeredCount = answers.filter(a => !a.skipped).length;
+        const skippedCount = answers.filter(a => a.skipped).length;
+        const freeTextCount = answers.filter(a => a.freeText !== null).length;
+        const recommendedAvailableCount = questions.filter(
+            q => q.options?.some(opt => opt.recommended)
+        ).length;
+        const recommendedSelectedCount = questions.filter(q => {
+            const answer = result.answers[q.header];
+            const recommendedOption = q.options?.find(opt => opt.recommended);
+            return answer && !answer.skipped && recommendedOption
+                && answer.selected.includes(recommendedOption.label);
+        }).length;
+
+        this._sendTelemetry(
+            options.chatRequestId,
+            questions.length,
+            answeredCount,
+            skippedCount,
+            freeTextCount,
+            recommendedAvailableCount,
+            recommendedSelectedCount,
+            stopWatch.elapsed()
+        );
+
+        const toolResultJson = JSON.stringify(result);
+        this._logService.trace(`[AskQuestionsTool] Returning tool result: ${toolResultJson}`);
+        return new LanguageModelToolResult([
+            new LanguageModelTextPart(toolResultJson)
+        ]);
+    }
+
+    async resolveInput(
+        input: IAskQuestionsParams,
+        promptContext: IBuildPromptContext,
+        _mode: CopilotToolMode
+    ): Promise<IAskQuestionsParams> {
+        this._promptContext = promptContext;
+        return input;
+    }
+
+    private _convertToChatQuestion(question: IQuestion): ChatQuestion {
+        // Determine question type based on options and multiSelect
+        let type: ChatQuestionType;
+        if (!question.options || question.options.length === 0) {
+            type = ChatQuestionType.Text;
+        } else if (question.multiSelect) {
+            type = ChatQuestionType.MultiSelect;
+        } else {
+            type = ChatQuestionType.SingleSelect;
+        }
+
+        // Find default value from recommended option
+        let defaultValue: string | string[] | undefined;
+        if (question.options) {
+            const recommendedOptions = question.options.filter(opt => opt.recommended);
+            if (recommendedOptions.length > 0) {
+                if (question.multiSelect) {
+                    defaultValue = recommendedOptions.map(opt => opt.label);
+                } else {
+                    defaultValue = recommendedOptions[0].label;
+                }
+            }
+        }
+
+        return new ChatQuestion(
+            question.header,       // id
+            type,                  // ChatQuestionType
+            question.header,       // title
+            {
+                message: question.question,
+                options: question.options?.map(opt => ({
+                    id: opt.label,
+                    label: `${opt.label}${opt.description ? ' - ' + opt.description : ''}`,
+                    value: opt.label
+                })),
+                defaultValue,
+                allowFreeformInput: question.allowFreeformInput ?? false
+            }
+        );
+    }
+
+    protected _convertCarouselAnswers(
+        questions: IQuestion[],
+        carouselAnswers: Record<string, unknown> | undefined
+    ): IAnswerResult {
+        const result: IAnswerResult = { answers: {} };
+
+        if (carouselAnswers) {
+            this._logService.trace(
+                `[AskQuestionsTool] Carousel answer keys: ${Object.keys(carouselAnswers).join(', ')}`
+            );
+            this._logService.trace(
+                `[AskQuestionsTool] Question headers: ${questions.map(q => q.header).join(', ')}`
+            );
+        }
+
+        for (const question of questions) {
+            if (!carouselAnswers) {
+                // User skipped all questions
+                result.answers[question.header] = { selected: [], freeText: null, skipped: true };
+                continue;
+            }
+
+            const answer = carouselAnswers[question.header];
+            this._logService.trace(
+                `[AskQuestionsTool] Processing question "${question.header}", ` +
+                `raw answer: ${JSON.stringify(answer)}, type: ${typeof answer}`
+            );
+
+            if (answer === undefined) {
+                result.answers[question.header] = { selected: [], freeText: null, skipped: true };
+
+            } else if (typeof answer === 'string') {
+                // String answer: match against option labels (case-sensitive)
+                if (question.options?.some(opt => opt.label === answer)) {
+                    result.answers[question.header] = { selected: [answer], freeText: null, skipped: false };
+                } else {
+                    result.answers[question.header] = { selected: [], freeText: answer, skipped: false };
+                }
+
+            } else if (Array.isArray(answer)) {
+                // Array answer: coerce elements to strings
+                result.answers[question.header] = {
+                    selected: answer.map(a => String(a)),
+                    freeText: null,
+                    skipped: false
+                };
+
+            } else if (typeof answer === 'object' && answer !== null) {
+                // Object answer: VS Code returns various shapes
+                const answerObj = answer as Record<string, unknown>;
+
+                // Extract freeform text (empty string treated as absent)
+                const freeformValue =
+                    ('freeformValue' in answerObj
+                        && typeof answerObj.freeformValue === 'string'
+                        && answerObj.freeformValue)
+                        ? answerObj.freeformValue
+                        : null;
+
+                if ('selectedValues' in answerObj && Array.isArray(answerObj.selectedValues)) {
+                    // Multi-select: { selectedValues: string[] }
+                    result.answers[question.header] = {
+                        selected: answerObj.selectedValues.map(v => String(v)),
+                        freeText: freeformValue,
+                        skipped: false
+                    };
+                } else if ('selectedValue' in answerObj) {
+                    const value = answerObj.selectedValue;
+                    if (typeof value === 'string') {
+                        if (question.options?.some(opt => opt.label === value)) {
+                            result.answers[question.header] = {
+                                selected: [value], freeText: freeformValue, skipped: false
+                            };
+                        } else {
+                            // selectedValue not a known option → treat as free text
+                            result.answers[question.header] = {
+                                selected: [], freeText: freeformValue ?? value, skipped: false
+                            };
+                        }
+                    } else if (Array.isArray(value)) {
+                        result.answers[question.header] = {
+                            selected: value.map(v => String(v)),
+                            freeText: freeformValue,
+                            skipped: false
+                        };
+                    } else if (value === undefined || value === null) {
+                        if (freeformValue) {
+                            result.answers[question.header] = {
+                                selected: [], freeText: freeformValue, skipped: false
+                            };
+                        } else {
+                            result.answers[question.header] = {
+                                selected: [], freeText: null, skipped: true
+                            };
+                        }
+                    }
+                } else if ('freeformValue' in answerObj && freeformValue) {
+                    // Only freeform text, no selection
+                    result.answers[question.header] = {
+                        selected: [], freeText: freeformValue, skipped: false
+                    };
+                } else if ('label' in answerObj && typeof answerObj.label === 'string') {
+                    // Raw option object
+                    result.answers[question.header] = {
+                        selected: [answerObj.label], freeText: null, skipped: false
+                    };
+                } else {
+                    // Unknown object format
+                    this._logService.warn(
+                        `[AskQuestionsTool] Unknown answer object format for ` +
+                        `"${question.header}": ${JSON.stringify(answer)}`
+                    );
+                    result.answers[question.header] = { selected: [], freeText: null, skipped: true };
+                }
+
+            } else {
+                // Unknown primitive type (number, boolean, etc.)
+                this._logService.warn(
+                    `[AskQuestionsTool] Unknown answer format for ` +
+                    `"${question.header}": ${typeof answer}`
+                );
+                result.answers[question.header] = { selected: [], freeText: null, skipped: true };
+            }
+        }
+
+        return result;
+    }
+
+    private _sendTelemetry(
+        requestId: string | undefined,
+        questionCount: number,
+        answeredCount: number,
+        skippedCount: number,
+        freeTextCount: number,
+        recommendedAvailableCount: number,
+        recommendedSelectedCount: number,
+        duration: number
+    ): void {
+        this._telemetryService.sendMSFTTelemetryEvent('askQuestionsToolInvoked',
+            { requestId },
+            {
+                questionCount,
+                answeredCount,
+                skippedCount,
+                freeTextCount,
+                recommendedAvailableCount,
+                recommendedSelectedCount,
+                duration,
+            }
+        );
+    }
+
+    prepareInvocation(
+        options: vscode.LanguageModelToolInvocationPrepareOptions<IAskQuestionsParams>,
+        token: vscode.CancellationToken
+    ): vscode.ProviderResult<vscode.PreparedToolInvocation> {
+        const { questions } = options.input;
+
+        // Validate input early before showing UI
+        if (!questions || questions.length === 0) {
+            throw new Error(vscode.l10n.t(
+                'No questions provided. The questions array must contain at least one question.'
+            ));
+        }
+
+        for (const question of questions) {
+            // Options with 1 item don't make sense - need 0 (free text) or 2+ (choice)
+            if (question.options && question.options.length === 1) {
+                throw new Error(vscode.l10n.t(
+                    'Question "{0}" must have at least two options, or none for free text input.',
+                    question.header
+                ));
+            }
+        }
+
+        const questionCount = questions.length;
+        const headers = questions.map(q => q.header).join(', ');
+        const message = questionCount === 1
+            ? vscode.l10n.t('Asking a question ({0})', headers)
+            : vscode.l10n.t('Asking {0} questions ({1})', questionCount, headers);
+        const pastMessage = questionCount === 1
+            ? vscode.l10n.t('Asked a question ({0})', headers)
+            : vscode.l10n.t('Asked {0} questions ({1})', questionCount, headers);
+
+        return {
+            invocationMessage: new MarkdownString(message),
+            pastTenseMessage: new MarkdownString(pastMessage)
+        };
+    }
+}
+
+ToolRegistry.registerTool(AskQuestionsTool);
+```
+
+---
+
+## VS Code Proposed API Types
+
+The carousel UI depends on the proposed `chatParticipantAdditions` API. These types are defined in `src/extension/vscode.proposed.chatParticipantAdditions.d.ts` and re-exported via `src/vscodeTypes.ts`.
+
+### ChatQuestionType
+
+```typescript
+export enum ChatQuestionType {
+    /** A free-form text input question. */
+    Text = 1,
+    /** A single-select question with radio buttons. */
+    SingleSelect = 2,
+    /** A multi-select question with checkboxes. */
+    MultiSelect = 3
+}
+```
+
+### ChatQuestionOption
+
+```typescript
+export interface ChatQuestionOption {
+    /** Unique identifier for the option. */
+    id: string;
+    /** The display label for the option. */
+    label: string;
+    /** The value returned when this option is selected. */
+    value: unknown;
+}
+```
+
+### ChatQuestion
+
+```typescript
+export class ChatQuestion {
+    /** Unique identifier for the question. */
+    id: string;
+    /** Text, SingleSelect, or MultiSelect. */
+    type: ChatQuestionType;
+    /** The title/header of the question. */
+    title: string;
+    /** Optional detailed message or description. */
+    message?: string | MarkdownString;
+    /** Options for SingleSelect or MultiSelect questions. */
+    options?: ChatQuestionOption[];
+    /** Default selected option id(s). */
+    defaultValue?: string | string[];
+    /** Whether to allow free-form text input alongside options. */
+    allowFreeformInput?: boolean;
+
+    constructor(
+        id: string,
+        type: ChatQuestionType,
+        title: string,
+        options?: {
+            message?: string | MarkdownString;
+            options?: ChatQuestionOption[];
+            defaultValue?: string | string[];
+            allowFreeformInput?: boolean;
+        }
+    );
+}
+```
+
+### ChatResponseQuestionCarouselPart
+
+```typescript
+export class ChatResponseQuestionCarouselPart {
+    /** The questions to display in the carousel. */
+    questions: ChatQuestion[];
+    /** Whether users can skip answering the questions. */
+    allowSkip: boolean;
+
+    constructor(questions: ChatQuestion[], allowSkip?: boolean);
+}
+```
+
+### ChatResponseStream.questionCarousel
+
+```typescript
+interface ChatResponseStream {
+    questionCarousel(
+        questions: ChatQuestion[],
+        allowSkip?: boolean
+    ): Thenable<Record<string, unknown> | undefined>;
+}
+```
+
+Returns `undefined` when the user dismisses the entire carousel. Otherwise, returns a record keyed by question `id` (which is set to `question.header` by the tool). Values are heterogeneous — see the answer normalization section below.
+
+---
+
+## Answer Normalization: `_convertCarouselAnswers`
+
+The carousel API returns answers in various shapes depending on VS Code's internal UI implementation. `_convertCarouselAnswers` normalizes these into a uniform `IQuestionAnswer` structure.
+
+### Dispatch Table
+
+| Raw Answer Shape | Condition | Result |
+|---|---|---|
+| `undefined` (whole record) | `carouselAnswers === undefined` | All questions → `skipped: true` |
+| `undefined` (per-question) | `answer === undefined` | That question → `skipped: true` |
+| `string` | Matches an option label (case-sensitive) | `selected: [answer]` |
+| `string` | No option match | `freeText: answer` |
+| `string[]` (array) | Any elements | `selected: elements.map(String)` |
+| `{ selectedValues: string[] }` | Multi-select | `selected: values.map(String)`, optional `freeText` |
+| `{ selectedValue: string }` | Matches option label | `selected: [value]`, optional `freeText` |
+| `{ selectedValue: string }` | No option match | `freeText: freeformValue ?? value` |
+| `{ selectedValue: array }` | Array variant | `selected: value.map(String)`, optional `freeText` |
+| `{ selectedValue: null/undefined }` | With `freeformValue` | `freeText: freeformValue` |
+| `{ selectedValue: null/undefined }` | Without `freeformValue` | `skipped: true` |
+| `{ freeformValue: string }` | Only freeform, no selection keys | `freeText: freeformValue` |
+| `{ label: string }` | Raw option object | `selected: [label]` |
+| `{ unknownProperty }` | Unrecognized object | `skipped: true` (warning logged) |
+| `number`, `boolean`, etc. | Primitive non-string | `skipped: true` (warning logged) |
+
+**Key behaviours:**
+- Option matching is **case-sensitive** (`'yes'` does not match `'Yes'`).
+- Empty `freeformValue` (`''`) is treated as absent (falsy check); `freeText` is set to `null`.
+- When both `selectedValue` and `freeformValue` are present, both are preserved in the result.
+- When `selectedValue` does not match any option and `freeformValue` is also provided, `freeformValue` takes precedence as `freeText`.
+- Extra keys in `carouselAnswers` not corresponding to any question header are silently ignored.
+
+---
+
+## Supporting Interfaces and Services
+
+### IBuildPromptContext (excerpt)
+
+The `resolveInput` method captures an `IBuildPromptContext` instance to access the `stream` property. Relevant fields:
+
+```typescript
+export interface IBuildPromptContext {
+    readonly requestId?: string;
+    readonly query: string;
+    readonly stream?: vscode.ChatResponseStream;   // ← used by askQuestions
+    readonly tools?: {
+        readonly toolReferences: readonly InternalToolReference[];
+        readonly toolInvocationToken: vscode.ChatParticipantToolToken;
+        readonly availableTools: readonly vscode.LanguageModelToolInformation[];
+    };
+    // ... additional fields omitted
+}
+```
+
+### ICopilotTool<T> (interface)
+
+```typescript
+export interface ICopilotTool<T> extends ICopilotToolExtension<T> {
+    invoke?: vscode.LanguageModelTool<T>['invoke'];
+    prepareInvocation?: vscode.LanguageModelTool<T>['prepareInvocation'];
+}
+```
+
+The `resolveInput` method comes from `ICopilotToolExtension<T>`:
+
+```typescript
+export interface ICopilotToolExtension<T> {
+    resolveInput?(input: T, promptContext: IBuildPromptContext, mode: CopilotToolMode): Promise<T>;
+    // ... other optional methods
+}
+```
+
+### CopilotToolMode
+
+```typescript
+export enum CopilotToolMode {
+    /** Give a shorter result, agent mode can call again to get more context */
+    PartialContext,
+    /** Give a longer result, it gets one shot */
+    FullContext,
+}
+```
+
+### ToolName
+
+```typescript
+// In src/extension/tools/common/toolNames.ts
+export enum ToolName {
+    AskQuestions = 'ask_questions',  // internal name
+    // ...
+}
+
+export enum ContributedToolName {
+    AskQuestions = 'copilot_askQuestions',  // VS Code registration name
+    // ...
+}
+
+// Tool category mapping
+ToolCategory mapping: ToolName.AskQuestions → ToolCategory.VSCodeInteraction
+```
+
+---
+
+## Configuration
+
+### Setting: `github.copilot.chat.askQuestions.enabled`
+
+| Property | Value |
+|---|---|
+| Type | `boolean` |
+| Default | `true` |
+| Description | "Allow agent mode to ask clarifying questions before proceeding with a task." |
+| Tags | `experimental`, `onExp` |
+
+The `when` clause in the tool declaration (`config.github.copilot.chat.askQuestions.enabled`) ensures the tool is only registered when the setting is enabled.
+
+---
+
+## Telemetry
+
+### Event: `askQuestionsToolInvoked`
+
+Fired once per `invoke()` call, after answers are collected:
+
+| Property | Classification | Type | Description |
+|---|---|---|---|
+| `requestId` | SystemMetaData | `string \| undefined` | Chat request turn ID (`options.chatRequestId`) |
+| `questionCount` | SystemMetaData | measurement | Total questions asked |
+| `answeredCount` | SystemMetaData | measurement | Questions answered (not skipped) |
+| `skippedCount` | SystemMetaData | measurement | Questions skipped |
+| `freeTextCount` | SystemMetaData | measurement | Questions answered with free text |
+| `recommendedAvailableCount` | SystemMetaData | measurement | Questions with a `recommended` option |
+| `recommendedSelectedCount` | SystemMetaData | measurement | Questions where user chose the recommended option |
+| `duration` | SystemMetaData | measurement | Total time in milliseconds (StopWatch elapsed) |
+
+GDPR annotations are present in the source for data governance compliance.
+
+---
+
+## Test Coverage
+
+Test file: `src/extension/tools/vscode-node/test/askQuestionsTool.spec.ts`
+
+Tests exercise `_convertCarouselAnswers` via a `TestableAskQuestionsTool` subclass that exposes the protected method. The test file defines local type aliases rather than importing from the source.
+
+### Test Suites
+
+| Suite | Cases | Key Behaviours Verified |
+|---|---|---|
+| `carouselAnswers is undefined` | 1 | All questions marked skipped |
+| `answer undefined for a question` | 2 | Individual skipped; partial answers handled |
+| `answer is a string` | 4 | Option matching, free-text fallback, no-options case, empty string |
+| `answer is an array` | 3 | Multi-select, non-string coercion, empty array |
+| `selectedValue (VS Code format)` | 4 | Matching option, non-matching → free text, array value, free-text question |
+| `selectedValues (VS Code multi-select)` | 3 | Multi-select, empty array, non-string coercion |
+| `label property` | 1 | Raw option object format |
+| `freeform text with options` | 8 | freeformValue only, null/undefined selectedValue + freeform, both selection + freeform, multi-select + freeform, empty freeformValue, non-matching selectedValue + freeform, skipped on null selectedValue without freeform |
+| `unknown format` | 4 | Unknown object, number, boolean, null |
+| `edge cases` | 6 | Empty questions array, special chars in headers, unicode headers, mixed formats, case-sensitive matching, extra keys ignored |
+
+Total: **36 test cases** across 10 suites.
+
+---
+
+## Portability Assessment
+
+### API Dependencies
+
+| Dependency | Status | Impact |
+|---|---|---|
+| `vscode.ChatResponseStream.questionCarousel()` | **Proposed** (`chatParticipantAdditions`) | Cannot be used by marketplace extensions without special enablement. Core dependency for the carousel UI. |
+| `ChatQuestion`, `ChatQuestionType`, `ChatQuestionOption` | **Proposed** | Types for constructing carousel questions. |
+| `ChatResponseQuestionCarouselPart` | **Proposed** | Part type for the carousel response. |
+| `vscode.LanguageModelTool<T>` | Stable | Standard tool interface. |
+| `vscode.l10n.t()` | Stable | Localization API. |
+
+**Verdict:** This tool has a hard dependency on the proposed `chatParticipantAdditions` API for its primary UI mechanism. It cannot be ported to a standalone marketplace extension without either:
+1. The `chatParticipantAdditions` proposal being finalized and promoted to stable API, or
+2. Implementing a fallback UI (e.g., QuickPick-based, as used in the previous version of this tool).
+
+The `resolveInput` → `IBuildPromptContext` → `stream` chain is also internal infrastructure specific to the Copilot Chat extension's tool registry and is not part of the public VS Code extension API.
