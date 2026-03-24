@@ -2,7 +2,7 @@
 	"name": "copilot-chat",
 	"displayName": "GitHub Copilot Chat",
 	"description": "AI chat features powered by Copilot",
-	"version": "0.41.0",
+	"version": "0.42.0",
 	"build": "1",
 	"internalAIKey": "1058ec22-3c95-4951-8443-f26c1f325911",
 	"completionsCoreVersion": "1.378.1799",
@@ -4561,6 +4561,14 @@
 							"advanced"
 						]
 					},
+					"github.copilot.chat.cli.forkSessions.enabled": {
+						"type": "boolean",
+						"default": false,
+						"markdownDescription": "%github.copilot.config.cli.forkSessions.enabled%",
+						"tags": [
+							"advanced"
+						]
+					},
 					"github.copilot.chat.cli.isolationOption.enabled": {
 						"type": "boolean",
 						"default": true,
@@ -6034,7 +6042,8 @@
 				],
 				"customAgentTarget": "github-copilot",
 				"requiresCustomModels": true,
-				"autoAttachReferences": true
+				"autoAttachReferences": true,
+				"useRequestToPopulateBuiltInPickers": true
 			},
 			{
 				"type": "copilot-cloud-agent",
@@ -6287,8 +6296,8 @@
 		"zod": "3.25.76"
 	},
 	"dependencies": {
-		"@anthropic-ai/claude-agent-sdk": "^0.2.76",
-		"@anthropic-ai/sdk": "^0.79.0",
+		"@anthropic-ai/claude-agent-sdk": "^0.2.81",
+		"@anthropic-ai/sdk": "^0.80.0",
 		"@github/blackbird-external-ingest-utils": "^0.3.0",
 		"@github/copilot": "^1.0.10",
 		"@google/genai": "^1.22.0",
@@ -6338,5 +6347,5 @@
 		"node-gyp": "npm:node-gyp@10.3.1",
 		"zod": "3.25.76"
 	},
-	"vscodeCommit": "55969564bb5637a0fe1bdf5a665c5c5f21723407"
+	"vscodeCommit": "cdf4f2f548f0cd60f7804b6837a0512a15a02889"
 }
